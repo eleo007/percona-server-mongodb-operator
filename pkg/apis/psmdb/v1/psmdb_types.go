@@ -30,7 +30,7 @@ import (
 	"github.com/percona/percona-server-mongodb-operator/pkg/mcs"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
 	"github.com/percona/percona-server-mongodb-operator/pkg/util/numstr"
-	"github.com/percona/percona-server-mongodb-operator/version"
+	"github.com/percona/percona-server-mongodb-operator/pkg/version"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -97,6 +97,7 @@ type PerconaServerMongoDBSpec struct {
 	Users                        []User                               `json:"users,omitempty"`
 	Roles                        []Role                               `json:"roles,omitempty"`
 	VolumeExpansionEnabled       bool                                 `json:"enableVolumeExpansion,omitempty"`
+	LogCollector                 *LogCollectorSpec                    `json:"logcollector,omitempty"`
 }
 
 type UserRole struct {
@@ -196,7 +197,7 @@ const (
 	SmartUpdateStatefulSetStrategyType appsv1.StatefulSetUpdateStrategyType = "SmartUpdate"
 )
 
-// DNS Mode string describes the mode used to generate fqdn/ip for communication between nodes
+// DNSMode string describes the mode used to generate fqdn/ip for communication between nodes
 // +enum
 type DNSMode string
 
@@ -369,6 +370,7 @@ type PMMSpec struct {
 	CustomClusterName string `json:"customClusterName,omitempty"`
 }
 
+// HasSecret is used for PMM2. PMM2 is reaching its EOL.
 func (pmm *PMMSpec) HasSecret(secret *corev1.Secret) bool {
 	if len(secret.Data) == 0 {
 		return false
@@ -380,6 +382,7 @@ func (pmm *PMMSpec) HasSecret(secret *corev1.Secret) bool {
 	return false
 }
 
+// ShouldUseAPIKeyAuth is used for PMM2. PMM2 is reaching its EOL.
 func (spec *PMMSpec) ShouldUseAPIKeyAuth(secret *corev1.Secret) bool {
 	if _, ok := secret.Data[PMMAPIKey]; !ok {
 		_, okl := secret.Data[PMMUserKey]
@@ -511,6 +514,26 @@ func (nv *NonVotingSpec) GetSize() int32 {
 	return nv.Size
 }
 
+type HiddenSpec struct {
+	Enabled                  bool                       `json:"enabled"`
+	Size                     int32                      `json:"size"`
+	VolumeSpec               *VolumeSpec                `json:"volumeSpec,omitempty"`
+	ReadinessProbe           *corev1.Probe              `json:"readinessProbe,omitempty"`
+	LivenessProbe            *LivenessProbeExtended     `json:"livenessProbe,omitempty"`
+	PodSecurityContext       *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext    `json:"containerSecurityContext,omitempty"`
+	Configuration            MongoConfiguration         `json:"configuration,omitempty"`
+
+	MultiAZ `json:",inline"`
+}
+
+func (h *HiddenSpec) GetSize() int32 {
+	if !h.Enabled {
+		return 0
+	}
+	return h.Size
+}
+
 type MongoConfiguration string
 
 func (conf MongoConfiguration) GetOptions(name string) (map[interface{}]interface{}, error) {
@@ -556,8 +579,8 @@ func (conf MongoConfiguration) GetTLSMode() (string, error) {
 	return mode, nil
 }
 
-// IsEncryptionEnabled returns nil if "enableEncryption" field is not specified or the pointer to the value of this field
-func (conf MongoConfiguration) IsEncryptionEnabled() (*bool, error) {
+// isEncryptionEnabled returns nil if "enableEncryption" field is not specified or the pointer to the value of this field
+func (conf MongoConfiguration) isEncryptionEnabled() (*bool, error) {
 	m, err := conf.GetOptions("security")
 	if err != nil || m == nil {
 		return nil, err
@@ -720,6 +743,7 @@ type ReplsetSpec struct {
 	Configuration            MongoConfiguration           `json:"configuration,omitempty"`
 	ExternalNodes            []*ExternalNode              `json:"externalNodes,omitempty"`
 	NonVoting                NonVotingSpec                `json:"nonvoting,omitempty"`
+	Hidden                   HiddenSpec                   `json:"hidden,omitempty"`
 	HostAliases              []corev1.HostAlias           `json:"hostAliases,omitempty"`
 	Horizons                 HorizonsSpec                 `json:"splitHorizons,omitempty"`
 	ReplsetOverrides         ReplsetOverrides             `json:"replsetOverrides,omitempty"`
@@ -754,6 +778,10 @@ func (ms ReplsetSpec) GetPort() int32 {
 		return p
 	}
 	return DefaultMongoPort
+}
+
+func (r ReplsetSpec) GetSize() int32 {
+	return r.Size + r.Arbiter.GetSize() + r.NonVoting.GetSize() + r.Hidden.GetSize()
 }
 
 type LivenessProbeExtended struct {
@@ -916,9 +944,12 @@ type MongodSpecInMemory struct {
 }
 
 type BackupTaskSpec struct {
-	Name             string                   `json:"name"`
-	Enabled          bool                     `json:"enabled"`
-	Keep             int                      `json:"keep,omitempty"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Deprecated: Use Retention instead. This field will be removed in the future
+	Keep int `json:"keep,omitempty"`
+	// +optional
+	Retention        *BackupTaskSpecRetention `json:"retention,omitempty"`
 	Schedule         string                   `json:"schedule,omitempty"`
 	StorageName      string                   `json:"storageName,omitempty"`
 	CompressionType  compress.CompressionType `json:"compressionType,omitempty"`
@@ -926,6 +957,36 @@ type BackupTaskSpec struct {
 
 	// +kubebuilder:validation:Enum={logical,physical,incremental,incremental-base}
 	Type defs.BackupType `json:"type,omitempty"`
+}
+
+func (task *BackupTaskSpec) GetRetention(cr *PerconaServerMongoDB) BackupTaskSpecRetention {
+	if task.Retention != nil && cr.CompareVersion("1.21.0") >= 0 {
+		return *task.Retention
+	}
+	return BackupTaskSpecRetention{
+		Type:              BackupTaskSpecRetentionTypeCount,
+		Count:             task.Keep,
+		DeleteFromStorage: true,
+	}
+}
+
+type BackupTaskSpecRetentionType string
+
+const (
+	BackupTaskSpecRetentionTypeCount = "count"
+)
+
+type BackupTaskSpecRetention struct {
+	// +kubebuilder:validation:Minimum=0
+	Count int `json:"count,omitempty"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum={count}
+	Type string `json:"type,omitempty"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:default=true
+	DeleteFromStorage bool `json:"deleteFromStorage,omitempty"`
 }
 
 func (task *BackupTaskSpec) JobName(cr *PerconaServerMongoDB) string {
@@ -1045,6 +1106,7 @@ type BackupSpec struct {
 	PITR                     PITRSpec                     `json:"pitr,omitempty"`
 	Configuration            BackupConfig                 `json:"configuration,omitempty"`
 	VolumeMounts             []corev1.VolumeMount         `json:"volumeMounts,omitempty"`
+	StartingDeadlineSeconds  *int64                       `json:"startingDeadlineSeconds,omitempty"`
 }
 
 func (b BackupSpec) IsPITREnabled() bool {
@@ -1186,6 +1248,7 @@ const (
 	PMMUserKey     = "PMM_SERVER_USER"
 	PMMPasswordKey = "PMM_SERVER_PASSWORD"
 	PMMAPIKey      = "PMM_SERVER_API_KEY"
+	PMMServerToken = "PMM_SERVER_TOKEN"
 )
 
 const (
@@ -1352,4 +1415,19 @@ func (cr *PerconaServerMongoDB) PBMResyncNeeded() bool {
 func (cr *PerconaServerMongoDB) PBMResyncInProgress() bool {
 	v, ok := cr.Annotations[AnnotationResyncInProgress]
 	return ok && v != ""
+}
+
+// LogCollectorSpec defines the configuration for enabling and customizing
+// the log collection component that stores logs in a PVC.
+type LogCollectorSpec struct {
+	Enabled                  bool                        `json:"enabled,omitempty"`
+	Image                    string                      `json:"image,omitempty"`
+	Resources                corev1.ResourceRequirements `json:"resources,omitempty"`
+	Configuration            string                      `json:"configuration,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext     `json:"containerSecurityContext,omitempty"`
+	ImagePullPolicy          corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+}
+
+func (cr *PerconaServerMongoDB) IsLogCollectorEnabled() bool {
+	return cr.Spec.LogCollector != nil && cr.Spec.LogCollector.Enabled
 }
